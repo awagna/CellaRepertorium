@@ -238,6 +238,107 @@ pairing_tables = function(ccdb, ranking_key = 'grp_rank', table_order = 2, min_e
 
 }
 
+#' Functionality to plot clonotypes
+#' 
+#' @param
+#' @param
+#' @param
+
+plot_clonotypes = function(){
+  expanded_cluster = dplyr::filter(cluster_pair_tbl, .data$n_clone_pairs >= min_expansion)
+  # Must have both cluster_ids non NA (otherwise not a pairing of the required order)
+  expanded_cluster = dplyr::filter_at(expanded_cluster, .vars = cluster_ids, .vars_predicate = dplyr::all_vars(!is.na(.)))
+  expanded_cluster = ungroup(expanded_cluster) %>% dplyr::select(!!!syms(cluster_ids_to_select), max_pairs = .data$n_clone_pairs)
+  if(!is.null(cluster_whitelist)){
+    expanded_cluster = bind_rows(expanded_cluster, cluster_whitelist)
+  }
+  if(!is.null(cluster_blacklist)) expanded_cluster = anti_join(expanded_cluster, cluster_blacklist)
+  
+  # Could have duplicated cluster_ids after binding to the whitelist or from considering orphans
+  expanded_cluster = expanded_cluster[!duplicated(expanded_cluster %>% dplyr::select(-.data$max_pairs)),]
+  expanded_c1 = cell_contig_tab %>% dplyr::inner_join(expanded_cluster, by = cluster_ids_to_select)
+  if(anyDuplicated(expanded_c1[cell_identifiers])) stop("Ruhoh, duplicated cell identifiers, this is a bug!")
+  
+  # cross-tab pairings in order to figure out how to order the cluster_idx to put most common pairing on diagonal
+  if(nrow(expanded_c1)>0 && table_order > 1){
+    expanded_counts = reshape2::dcast(expanded_c1, cluster_idx.1 ~ cluster_idx.2, fun.aggregate = length, value.var = 'max_pairs')
+    mat = expanded_counts[,-1]
+    #rownames(mat) = rowid[['cluster_idx']]
+    ro = hclust(dist(mat))$order
+    co = hclust(dist(t(mat)))$order
+  } else if (nrow(expanded_c1) == 0) {
+    warning('No pairs found')
+    return()
+  } else{
+    expanded_counts = reshape2::dcast(expanded_c1, cluster_idx.1 ~ ., fun.aggregate = length, value.var = 'max_pairs')
+    ro = order(expanded_counts[[2]])
+    co = NA_integer_
+  }
+  
+  ci_class = class(contig_tbl[[cluster_idx]])
+  as_method = if(ci_class == 'factor') as.factor else function(x) as(x, ci_class)
+  rowid = tibble(cluster_idx = expanded_counts$cluster_idx.1 %>% as_method, plot_order = ro)
+  colid = suppressWarnings(tibble(cluster_idx = colnames(expanded_counts)[-1] %>% as_method, plot_order = co))
+  rowid[['cluster_idx.1_fct']] = factor(rowid[['cluster_idx']], levels = rowid[['cluster_idx']][ro])
+  colid[['cluster_idx.2_fct']] = factor(colid[['cluster_idx']], levels = colid[['cluster_idx']][co])
+  
+  
+  # also fix levels of this tbl
+  expanded_c1 = expanded_c1 %>% mutate(cluster_idx.1_fct = factor(.data$cluster_idx.1, levels = levels(rowid[['cluster_idx.1_fct']])))
+  if(table_order>1) expanded_c1 = expanded_c1 %>% mutate(cluster_idx.2_fct = factor(.data$cluster_idx.2, levels = levels(colid[['cluster_idx.2_fct']])))
+  
+  if(!is.null(cell_tbl)){
+    if(anyDuplicated(cell_tbl %>% select(!!!syms(cell_identifiers)))) stop('`cell_tbl` must not have duplicate `cell_identifiers`.')
+    expanded_c1 = left_join(expanded_c1, cell_tbl, by = cell_identifiers)
+  }
+  
+  idx1_tbl = rowid %>% dplyr::rename(!!cluster_idx := cluster_idx)
+  idx2_tbl = colid %>% dplyr::rename(!!cluster_idx := cluster_idx)
+  feature_tbl = ccdb$cluster_tbl[unique(c(cluster_keys, cluster_idx))]
+  idx1_tbl = left_join_warn(idx1_tbl, feature_tbl, by = cluster_idx)
+  idx2_tbl = left_join_warn(idx2_tbl, feature_tbl, by = cluster_idx)
+  
+}
+
+#' Functionality to infer dual-chain clonotypes
+#' 
+#' @param ccdb ContigCellDB that has been clustered and ranked according to....?
+#' @param fine_cluster
+#' @param 
+#' 
+#' @return [ContigCellDB()] with updated cluster_tbl and updated cell_tbl
+infer_clonotypes = function(ccdb, ranking_key = 'grp_rank', table_order = 2, min_expansion = 2, orphan_level = 1, cluster_keys = character(), cluster_whitelist = NULL, cluster_blacklist = NULL, fine_cluster = TRUE, method = 'intersect'){
+  #browser()
+  if(orphan_level > table_order) stop('`ophan_level` must be less than or equal to `table_order`')
+  if(table_order < 1) stop('Table order must be at least 1')
+  
+  # get `table_order` most common clusters for each cell
+  # forcibly rename cluster_idx -> "cluster_idx"
+  contig_tbl = ccdb$contig_tbl
+  contig_tbl = contig_tbl[contig_tbl[[ranking_key]]<=table_order,]
+  table_order = max(contig_tbl[[ranking_key]])
+  cell_identifiers = ccdb$cell_pk
+  cluster_idx = ccdb$cluster_pk
+  cell_tbl = ccdb$cell_tbl
+  cell_contig_tab = tidyr::pivot_wider(contig_tbl[c(cell_identifiers, cluster_idx, ranking_key)], names_from = !!ranking_key, values_from = cluster_idx)
+  
+  # Set up cluster_ids for indexing into the pairing tables
+  cluster_ids =  str_c('cluster_idx.', seq_len(table_order))
+  names(cell_contig_tab)[(ncol(cell_contig_tab)-table_order+1):ncol(cell_contig_tab)] = cluster_ids
+  cluster_ids_to_select = cluster_ids[seq_len(orphan_level)]
+  
+  # In how many cells do each cluster pairing appear?
+  cluster_pair_tbl = cell_contig_tab %>% group_by(!!!syms(cluster_ids)) %>% summarize(n_clone_pairs = dplyr::n())
+  
+  
+  # Return updated ContigCellDB object with updated cluster_tbl and updated cell_tbl
+  #ccdb@cell_tbl = cell_contig_tab
+  #replace_cluster_tbl(ccdb, cluster_tbl = cluster_pair_tbl, contig_tbl = contig_tbl, cluster_pk = cluster_ids)
+  return(list(cell_contig_tab,contig_tbl,cluster_pair_tbl))
+}
+
+
+
 
 #' @export
 #' @describeIn enumerate_pairing Recode a table with IG chains
